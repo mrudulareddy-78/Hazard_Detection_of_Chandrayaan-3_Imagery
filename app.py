@@ -1,207 +1,277 @@
 import streamlit as st
 import torch
-import torch.nn as nn
 import numpy as np
 import cv2
 from PIL import Image
-from torchvision import transforms
 import matplotlib.pyplot as plt
-
-# =====================================
-# 1. MODEL (same architecture)
-# =====================================
-class ImprovedUNet(nn.Module):
-    def __init__(self, n_channels=3, n_classes=4):
-        super().__init__()
-
-        def block(i, o):
-            return nn.Sequential(
-                nn.Conv2d(i, o, 3, padding=1),
-                nn.BatchNorm2d(o),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(o, o, 3, padding=1),
-                nn.BatchNorm2d(o),
-                nn.ReLU(inplace=True),
-            )
-
-        self.enc1 = block(3, 64)
-        self.enc2 = block(64, 128)
-        self.enc3 = block(128, 256)
-        self.enc4 = block(256, 512)
-
-        self.pool = nn.MaxPool2d(2)
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-        self.dec1 = block(512+256, 256)
-        self.dec2 = block(256+128, 128)
-        self.dec3 = block(128+64, 64)
-
-        self.final = nn.Conv2d(64, 4, kernel_size=1)
-
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        e4 = self.enc4(self.pool(e3))
-
-        d1 = self.dec1(torch.cat([self.up(e4), e3], dim=1))
-        d2 = self.dec2(torch.cat([self.up(d1), e2], dim=1))
-        d3 = self.dec3(torch.cat([self.up(d2), e1], dim=1))
-
-        return self.final(d3)
-
-# =====================================
-# 2. SAFE CHECKPOINT LOADING
-# =====================================
+import requests
 import numpy
-torch.serialization.add_safe_globals([numpy._core.multiarray.scalar])
+import torch.serialization
+import time
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = ImprovedUNet().to(device)
+from utils import edge_inference, cloud_inference, load_edge_model, push_result_to_cloud
 
-checkpoint = torch.load(
-    "unet_rover_best.pth",
-    map_location=device,
-    weights_only=False
+
+# ======================================================
+# PAGE CONFIG
+# ======================================================
+st.set_page_config(
+    page_title="Chandrayaan-3 Hazard Detection",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
-model.load_state_dict(checkpoint["model_state_dict"])
-model.eval()
 
-# =====================================
-# 3. PREPROCESSING
-# =====================================
-transform_img = transforms.Compose([
-    transforms.Resize((384, 384)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
-])
+# ======================================================
+# SIDEBAR (MODE FIRST)
+# ======================================================
+st.sidebar.markdown("## 🚀 Mission Control")
 
-# =====================================
-# 4. COLOR MAPS
-# =====================================
-CLASS_NAMES = {
-    0: "Background",
-    1: "Danger",
-    2: "Safe",
-    3: "Caution",
-}
+mode = st.sidebar.radio(
+    "🌐 Inference Mode",
+    ["🟢 Offline (Edge)", "☁️ Online (Cloud)", "🤖 Auto (Hybrid)"],
+    index=2
+)
 
-CLASS_COLORS = {
-    0: (0, 0, 0),
-    1: (255, 0, 0),
-    2: (0, 255, 0),
-    3: (255, 255, 0),
-}
+overlay_alpha = st.sidebar.slider(
+    "🎨 Overlay Transparency", 0.0, 1.0, 0.45, 0.05
+)
 
-def decode_mask(mask):
-    h, w = mask.shape
-    res = np.zeros((h, w, 3), dtype=np.uint8)
-    for cls, color in CLASS_COLORS.items():
-        res[mask == cls] = color
-    return res
-
-# =====================================
-# 5. STREAMLIT UI
-# =====================================
-st.set_page_config(page_title="Rover Segmentation", layout="wide")
-
-st.markdown("<h1 style='text-align:center; color:#10b981;'>Hazard Detection Using Chandrayaan-3 Imagery</h1>", unsafe_allow_html=True)
-
-uploaded_files = st.file_uploader(
-    "📤 Upload Rover Images",
+uploaded_files = st.sidebar.file_uploader(
+    "📤 Upload Lunar Images",
     type=["png", "jpg", "jpeg"],
     accept_multiple_files=True
 )
 
+# ======================================================
+# TITLE
+# ======================================================
+st.markdown("""
+<div style="text-align:center; padding:2rem;">
+    <h1>🛰️ Chandrayaan-3 Hazard Detection System</h1>
+    <p><b>Hybrid Edge–Cloud AI for Autonomous Rover Navigation</b></p>
+</div>
+""", unsafe_allow_html=True)
 
-tabs = st.tabs(["🖼️ Segmentation", "📊 Report & Analysis"])
+# ======================================================
+# SYSTEM STATUS PANEL (KEY FOR DEMO 🔥)
+# ======================================================
+st.markdown("## 🖥️ System Status")
 
-# =====================================
-# MULTI IMAGE PROCESSING
-# =====================================
+cloud_online = False
+if mode != "🟢 Offline (Edge)":
+    try:
+        requests.get("http://localhost:8000/docs", timeout=1)
+        cloud_online = True
+    except:
+        cloud_online = False
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    st.success("🟢 Edge AI: ACTIVE")
+
+with c2:
+    if cloud_online:
+        st.success("☁️ Cloud: ONLINE")
+    else:
+        st.error("☁️ Cloud: OFFLINE")
+
+with c3:
+    st.info(f"⚙️ Mode: {mode}")
+
+st.divider()
+if st.button("🔄 Refresh System Status"):
+    st.rerun()
+
+# ======================================================
+# PYTORCH SAFE LOAD FIX
+# ======================================================
+torch.serialization.add_safe_globals([
+    numpy.dtype,
+    numpy._core.multiarray.scalar
+])
+
+# ======================================================
+# LOAD EDGE MODEL
+# ======================================================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+edge_model = load_edge_model("unet_rover_best.pth", device)
+
+# ======================================================
+# CLASS COLORS
+# ======================================================
+CLASS_COLORS = {
+    0: (0, 0, 0),
+    1: (255, 0, 0),       # Safe
+    2: (0, 255, 0),       # Rocks
+    3: (255, 255, 0),     # Crater
+}
+
+def decode_mask(mask):
+    h, w = mask.shape
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    for cls, color in CLASS_COLORS.items():
+        out[mask == cls] = color
+    return out
+
+# ======================================================
+# MAIN LOGIC
+# ======================================================
 if uploaded_files:
     for uploaded in uploaded_files:
-
         st.divider()
-        st.subheader(f"🖼️ Processing: {uploaded.name}")
+        st.markdown(f"### 📷 Analyzing: `{uploaded.name}`")
 
         img = Image.open(uploaded).convert("RGB")
-        
-        timg = transform_img(img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            out = model(timg)
-            pred = torch.argmax(out, dim=1).squeeze().cpu().numpy()
 
+        # -----------------------------
+        # HYBRID INFERENCE LOGIC
+        # -----------------------------
+        if mode == "🟢 Offline (Edge)":
+            pred, used_mode, latency, data_sent = edge_inference(edge_model, img, device)
+
+
+
+        elif mode == "☁️ Online (Cloud)":
+            pred, used_mode, latency,data_sent = cloud_inference(img)
+
+            if pred is None:
+                st.error("❌ Cloud unavailable")
+                continue
+
+        else:  # 🤖 Auto Hybrid
+            pred, used_mode,latency,data_sent = cloud_inference(img)
+            if pred is None:
+                pred, used_mode,latency,data_sent = edge_inference(edge_model, img, device)
+                data_sent = 0
+
+                st.warning("⚠️ Cloud unavailable → Switched to EDGE automatically")
+            else:
+                st.success("☁️ Cloud available → Using cloud inference")
+
+        st.markdown(f"**Inference Source:** {used_mode}")
+        st.markdown("### 📡 Communication & Performance")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            if data_sent > 0:
+                st.success(f"📤 Data sent to cloud: {data_sent:.1f} KB")
+            else:
+                st.info("🟢 No data sent (Edge Processing)")
+
+        with c2:
+            if latency is not None:
+                st.success(f"⏱️ Inference latency: {latency:.1f} ms")
+
+        
+        # -----------------------------
+        # POST PROCESSING
+        # -----------------------------
+        base_img = np.array(img.resize((384, 384)))
         seg_mask = decode_mask(pred)
         overlay = cv2.addWeighted(
-            np.array(img.resize((384, 384))), 0.6,
-            seg_mask, 0.4,
-            0
+            base_img, 1-overlay_alpha,
+            seg_mask, overlay_alpha, 0
         )
 
-        tabs = st.tabs(["🖼️ Segmentation", "📊 Report & Analysis"])
+        total = pred.size
+        safe = np.sum(pred == 1) / total * 100
+        rocks = np.sum(pred == 2) / total * 100
+        crater = np.sum(pred == 3) / total * 100
+        hazard = rocks + crater
+                # -----------------------------
+        # EDGE → CLOUD SYNC
+        # -----------------------------
+        result_payload = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "safe": float(safe),
+            "rocks": float(rocks),
+            "crater": float(crater),
+            "source": used_mode
+        }
 
-        # ---------------- TAB 1 ----------------
-        with tabs[0]:
-            st.image(img, caption="Uploaded Image", use_container_width=True)
+        synced = push_result_to_cloud(result_payload)
 
+        if synced:
+            st.success("☁️ Synced latest result to ground station")
+        else:
+            st.info("📴 Cloud not reachable (running autonomously)")
+
+
+        c1, c2, c3, c4 = st.columns(4)
+        metrics = [
+            (c1, safe, "Safe Zone"),
+            (c2, crater, "Crater"),
+            (c3, rocks, "Rocks"),
+            (c4, hazard, "Hazard"),
+        ]
+
+        for col, val, label in metrics:
+            with col:
+                st.metric(label, f"{val:.1f}%")
+
+        # -----------------------------
+        # MISSION STATUS
+        # -----------------------------
+        if safe > 80:
+            st.success("✅ MISSION STATUS: SAFE FOR NAVIGATION")
+        elif safe > 60:
+            st.warning("⚠️ MISSION STATUS: PROCEED WITH CAUTION")
+        else:
+            st.error("🚫 MISSION STATUS: HAZARDOUS TERRAIN")
+
+        # -----------------------------
+        # VISUALS
+        # -----------------------------
+        t1, t2 = st.tabs(["🎨 Overlay View", "📊 Analysis"])
+
+        with t1:
+            st.image(overlay, use_container_width=True)
+
+        with t2:
             col1, col2 = st.columns(2)
-            with col1:
-                st.image(seg_mask, caption="🎨 Segmentation Mask", use_container_width=True)
-            with col2:
-                st.image(overlay, caption="🛰️ Overlay", use_container_width=True)
-
-            st.markdown("""
-            ### 🗺️ Legend
-            - 🔴 **Red** = Danger  
-            - 🟢 **Green** = Safe  
-            - 🟡 **Yellow** = Caution  
-            """)
-
-        # ---------------- TAB 2 ----------------
-        with tabs[1]:
-
-            st.header("📊 Pixel Distribution")
-            unique, counts = np.unique(pred, return_counts=True)
-            pixel_stats = dict(zip(unique, counts))
+            col1.image(seg_mask, caption="Segmentation Mask", use_container_width=True)
+            col2.image(base_img, caption="Original Image", use_container_width=True)
 
             fig, ax = plt.subplots()
             ax.bar(
-                [CLASS_NAMES[k] for k in pixel_stats.keys()],
-                pixel_stats.values()
+                ["Safe", "Crater", "Rocks"],
+                [safe, crater, rocks],
+                color=["red", "yellow", "green"]
             )
-            ax.set_ylabel("Pixel Count")
-            ax.set_title("Class Occurrence")
+            ax.set_ylim(0, 100)
+            ax.set_ylabel("Coverage (%)")
+            ax.set_title("Terrain Distribution")
             st.pyplot(fig)
+            st.markdown("### 📊 Edge vs Cloud: Latency & Bandwidth")
 
-            total = pred.size
-            st.subheader("📈 Class Coverage (%)")
+        labels = []
+        latencies = []
+        bandwidths = []
 
-            for cls, cnt in pixel_stats.items():
-                st.write(f"**{CLASS_NAMES[cls]}**: {cnt/total*100:.2f}%")
+        if "Edge" in used_mode:
+            labels.append("Edge")
+            latencies.append(latency)
+            bandwidths.append(data_sent)
 
-            st.subheader("📝 Auto-generated Report")
+        if "Cloud" in used_mode:
+            labels.append("Cloud")
+            latencies.append(latency)
+            bandwidths.append(data_sent)
 
-            summary = f"""
-### Rover Hazard Report – {uploaded.name}
+        fig, ax1 = plt.subplots()
 
-**Overall Classification Summary**
-- Danger (Red): {pixel_stats.get(1,0)/total*100:.2f}%  
-- Safe (Green): {pixel_stats.get(2,0)/total*100:.2f}%  
-- Caution (Yellow): {pixel_stats.get(3,0)/total*100:.2f}%  
+        ax1.bar(labels, latencies, color=["green", "blue"], alpha=0.7)
+        ax1.set_ylabel("Latency (ms)")
 
-**Interpretation**
-- The rover should **avoid red regions immediately**.  
-- Green zones can be considered **safe traversal paths**.  
-- Yellow zones indicate **partial instability / craters** and require caution.
+        ax2 = ax1.twinx()
+        ax2.plot(labels, bandwidths, color="red", marker="o")
+        ax2.set_ylabel("Data Sent (KB)")
 
-**Inference Confidence**
-This analysis is based on pixel-level segmentation using your trained UNet model.
-"""
-
-            st.markdown(summary)
+        ax1.set_title("Edge vs Cloud Performance Comparison")
+        st.pyplot(fig)
 
 
+else:
+    st.info("👈 Upload lunar terrain images from the sidebar to begin analysis.")
