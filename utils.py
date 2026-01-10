@@ -87,15 +87,23 @@ def cloud_inference(image_pil):
 # ------------------------
 # EDGE → CLOUD SYNC
 # ------------------------
-def push_result_to_cloud(result_dict):
-    CLOUD_DASHBOARD_URL = "https://YOUR-STREAMLIT-CLOUD-APP.streamlit.app/api/update"
+import json
+import subprocess
 
+SYNC_FILE = "sync_data.json"
+
+def push_result_to_cloud(data):
     try:
-        requests.post(
-            CLOUD_DASHBOARD_URL,
-            json=result_dict,
-            timeout=2
-        )
+        # Write latest result
+        with open(SYNC_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+        # Push to GitHub
+        subprocess.run(["git", "add", SYNC_FILE], check=True)
+        subprocess.run(["git", "commit", "-m", "Update rover sync data"], check=True)
+        subprocess.run(["git", "push"], check=True)
+
         return True
     except:
         return False
+
