@@ -1,7 +1,9 @@
 {
-  "timestamp": "2026-01-10 10:36:57",
-  "safe": 52.16064453125,
-  "rocks": 1.8324110243055556,
+  "timestamp": "2026-01-11 16:04:04",
+  "safe": 20.062255859375,
+  "rocks": 52.738444010416664,
   "crater": 0.0,
-  "source": "\ud83d\udfe2 Edge"
+  "source": "\ud83d\udfe2 Edge",
+  "latency_ms": 1180.678129196167,
+  "data_sent_kb": 0
 }
