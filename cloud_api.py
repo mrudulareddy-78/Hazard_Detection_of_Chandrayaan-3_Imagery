@@ -2,24 +2,21 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 app = FastAPI()
+latest_data = {}
 
-LATEST = {}
-
-class Telemetry(BaseModel):
+class Payload(BaseModel):
     timestamp: str
     safe: float
     rocks: float
     crater: float
     source: str
 
-@app.post("/push")
-def push_data(data: Telemetry):
-    global LATEST
-    LATEST = data.dict()
-    return {"status": "ok"}
+@app.post("/update")
+def update(data: Payload):
+    global latest_data
+    latest_data = data.dict()
+    return {"status": "received"}
 
 @app.get("/latest")
 def latest():
-    if LATEST:
-        return LATEST
-    return {"status": "no data"}
+    return latest_data
