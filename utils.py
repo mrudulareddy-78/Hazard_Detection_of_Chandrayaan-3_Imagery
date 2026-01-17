@@ -1,123 +1,20 @@
-# import torch
-# import numpy as np
-# import cv2
-# import requests
-# from torchvision import transforms
-# from model import ImprovedUNet
 
-# # ------------------------
-# # Preprocessing
-# # ------------------------
-# transform_img = transforms.Compose([
-#     transforms.Resize((384, 384)),
-#     transforms.ToTensor(),
-#     transforms.Normalize(
-#         mean=[0.485, 0.456, 0.406],
-#         std=[0.229, 0.224, 0.225]
-#     )
-# ])
-
-# # ------------------------
-# # EDGE INFERENCE
-# # ------------------------
-# def load_edge_model(weight_path, device):
-#     model = ImprovedUNet().to(device)
-#     checkpoint = torch.load(weight_path, map_location=device, weights_only=False)
-#     model.load_state_dict(checkpoint["model_state_dict"])
-#     model.eval()
-#     return model
-
-# import time
-
-# import time
-
-# def edge_inference(model, image_pil, device):
-#     start = time.time()
-
-#     timg = transform_img(image_pil).unsqueeze(0).to(device)
-#     with torch.no_grad():
-#         pred = torch.argmax(model(timg), dim=1).squeeze().cpu().numpy()
-
-#     latency_ms = (time.time() - start) * 1000
-#     data_sent_kb = 0.0  # EDGE sends nothing
-
-#     return pred, "🟢 Edge", latency_ms, data_sent_kb
-
-
-# # ------------------------
-# # CLOUD INFERENCE
-# # ------------------------
-# CLOUD_API_URL = "http://localhost:8000/predict"
-
-# import time
-# import cv2
-# import numpy as np
-# import requests
-
-# def cloud_inference(image_pil):
-#     try:
-#         start = time.time()
-
-#         # Encode image
-#         img_np = np.array(image_pil)
-#         _, encoded = cv2.imencode(".png", img_np)
-#         img_bytes = encoded.tobytes()
-
-#         data_sent_kb = len(img_bytes) / 1024  # KB sent
-
-#         # Simulated Earth–Moon delay
-#         time.sleep(1.2)
-
-#         response = requests.post(
-#             "http://localhost:8000/predict",
-#             files={"file": img_bytes},
-#             timeout=5
-#         )
-
-#         latency_ms = (time.time() - start) * 1000
-
-#         if response.status_code == 200:
-#             mask = np.array(response.json()["mask"])
-#             return mask, "☁️ Cloud", latency_ms, data_sent_kb
-
-#         return None, "❌ Cloud Error", None, 0.0
-
-#     except:
-#         return None, "❌ Cloud Unreachable", None, 0.0
-# # ------------------------
-# # EDGE → CLOUD SYNC
-# # ------------------------
-# import json
-# import subprocess
-
-# SYNC_FILE = "sync_data.json"
-
-# def push_result_to_cloud(payload):
-#     try:
-#         with open("sync_data.json", "w") as f:
-#             json.dump(payload, f, indent=2)
-
-#         subprocess.run(["git", "add", "sync_data.json"], check=True)
-#         subprocess.run(["git", "commit", "-m", "Telemetry update"], check=True)
-#         subprocess.run(["git", "push"], check=True)
-
-#         return True   # ✅ DATA SYNC SUCCESS
-#     except Exception as e:
-#         print("Cloud sync failed:", e)
-#         return False
-
-
-import torch
-import numpy as np
-import numpy
+import json
+import os
 import time
+from typing import List
+
+import numpy
+import numpy as np
 import requests
-from torchvision import transforms
-from model import ImprovedUNet
+import torch
 import torch.serialization
+from torchvision import transforms
+
+from model import ImprovedUNet
 
 # ======================================================
-# PYTORCH 2.6+ SAFE LOAD FIX
+# PYTORCH 2.6 SAFE LOAD
 # ======================================================
 torch.serialization.add_safe_globals([
     numpy.dtype,
@@ -125,9 +22,12 @@ torch.serialization.add_safe_globals([
 ])
 
 # ======================================================
-# 🔗 CLOUD ENDPOINT (RENDER)
+# CLOUD ENDPOINT (RENDER)
 # ======================================================
-CLOUD_API_URL = "https://hazard-detection-of-chandrayaan-3-imagery.onrender.com/push"
+CLOUD_API_URL = "https://hazard-detection-of-chandrayaan-3-imagery.onrender.com/update"
+
+# Local buffer file for offline-first telemetry.
+BUFFER_FILE = "telemetry_buffer.json"
 
 # ======================================================
 # IMAGE TRANSFORM
@@ -142,43 +42,100 @@ transform = transforms.Compose([
 # ======================================================
 def load_edge_model(model_path, device):
     model = ImprovedUNet().to(device)
-
     checkpoint = torch.load(
         model_path,
         map_location=device,
-        weights_only=False   # IMPORTANT for PyTorch 2.6+
+        weights_only=False
     )
-
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model
 
 # ======================================================
-# EDGE INFERENCE
+# EDGE INFERENCE (ALWAYS WORKS)
 # ======================================================
 def edge_inference(model, img, device):
     start = time.time()
 
     x = transform(img).unsqueeze(0).to(device)
-
     with torch.no_grad():
         pred = torch.argmax(model(x), dim=1).squeeze().cpu().numpy()
 
-    latency = (time.time() - start) * 1000  # ms
-    data_sent = 0  # edge does not send raw image
-
-    return pred, "🟢 Edge", latency, data_sent
+    latency_ms = (time.time() - start) * 1000
+    return pred, latency_ms
 
 # ======================================================
-# PUSH RESULT TO CLOUD (REAL COMMUNICATION)
+# TELEMETRY BUFFER HELPERS
 # ======================================================
-def push_result_to_cloud(payload):
+def _load_buffer() -> List[dict]:
+    if not os.path.exists(BUFFER_FILE):
+        return []
     try:
-        response = requests.post(
+        with open(BUFFER_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # Corrupt buffer: start fresh but do not block inference
+        return []
+
+
+def _persist_buffer(buffer: List[dict]) -> None:
+    with open(BUFFER_FILE, "w", encoding="utf-8") as f:
+        json.dump(buffer, f)
+
+
+def _post_payload(payload: dict) -> bool:
+    try:
+        r = requests.post(
             CLOUD_API_URL,
             json=payload,
             timeout=3
         )
-        return response.status_code == 200
-    except:
+        return r.ok
+    except Exception:
         return False
+
+
+def _flush_buffer(buffer: List[dict]) -> bool:
+    """Send buffered telemetry in-order; stop at first failure."""
+    if not buffer:
+        return True
+
+    for idx, item in enumerate(buffer):
+        if not _post_payload(item):
+            # Preserve remaining items in order for a later retry
+            _persist_buffer(buffer[idx:])
+            return False
+
+    # All sent; clear buffer
+    _persist_buffer([])
+    return True
+
+
+# ======================================================
+# PUSH RESULT TO CLOUD (OFFLINE-FIRST)
+# ======================================================
+def push_result_to_cloud(payload: dict) -> bool:
+    """Send telemetry; buffer locally if offline.
+
+    - First flush any older buffered records to preserve chronology.
+    - If current send fails, append it to the buffer.
+    - Always returns quickly to avoid blocking edge inference.
+    """
+    buffer = _load_buffer()
+
+    # Try to flush older records before the newest one.
+    if not _flush_buffer(buffer):
+        buffer = _load_buffer()
+        buffer.append(payload)
+        _persist_buffer(buffer)
+        return False
+
+    # Send the latest payload after older ones are flushed.
+    if _post_payload(payload):
+        return True
+
+    # Network still down: buffer the new payload.
+    buffer = _load_buffer()
+    buffer.append(payload)
+    _persist_buffer(buffer)
+    return False
