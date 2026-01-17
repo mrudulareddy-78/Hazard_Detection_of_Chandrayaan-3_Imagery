@@ -208,7 +208,8 @@ import torch.serialization
 from utils import (
     edge_inference,
     load_edge_model,
-    push_result_to_cloud
+    push_result_to_cloud,
+    auto_sync_buffer
 )
 
 # FIX: Import transforms for proper preprocessing
@@ -222,6 +223,15 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ======================================================
+# AUTO-SYNC BUFFERED DATA ON STARTUP
+# ======================================================
+if 'buffer_synced' not in st.session_state:
+    st.session_state.buffer_synced = True
+    synced_count = auto_sync_buffer()
+    if synced_count > 0:
+        st.toast(f"✅ Synced {synced_count} buffered record(s) to cloud!", icon="☁️")
 
 # ======================================================
 # TITLE

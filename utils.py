@@ -139,3 +139,25 @@ def push_result_to_cloud(payload: dict) -> bool:
     buffer.append(payload)
     _persist_buffer(buffer)
     return False
+
+
+# ======================================================
+# AUTO SYNC BUFFER ON STARTUP (NEW)
+# ======================================================
+def auto_sync_buffer() -> int:
+    """Attempt to sync buffered data on app startup.
+    
+    Returns the number of records successfully synced.
+    """
+    buffer = _load_buffer()
+    if not buffer:
+        return 0
+    
+    initial_count = len(buffer)
+    _flush_buffer(buffer)
+    
+    # Check how many are left after flush
+    remaining_buffer = _load_buffer()
+    synced_count = initial_count - len(remaining_buffer)
+    
+    return synced_count
