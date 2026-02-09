@@ -24,7 +24,7 @@ torch.serialization.add_safe_globals([
 # ======================================================
 # CLOUD ENDPOINT (RENDER)
 # ======================================================
-CLOUD_API_URL = "https://hazard-detection-of-chandrayaan-3-imagery.onrender.com/update"
+CLOUD_API_URL = "https://hazard-detection-of-chandrayaan-3-imagery-gwr1.onrender.com"
 
 # Local buffer file for offline-first telemetry.
 BUFFER_FILE = "telemetry_buffer.json"
