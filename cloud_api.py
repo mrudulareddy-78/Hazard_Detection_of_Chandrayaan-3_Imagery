@@ -1,14 +1,83 @@
 
+import os
 from typing import List
+from urllib.parse import urlparse
 
-from fastapi import FastAPI
+import mysql.connector
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 app = FastAPI()
 
-# In-memory time-series storage (ordered).
-telemetry_history: List[dict] = []
+MYSQL_URL = os.getenv("MYSQL_URL")
+
+
+def _parse_mysql_url(url: str) -> dict:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"mysql", "mysql+mysqlconnector"}:
+        raise ValueError("MYSQL_URL must start with mysql://")
+    return {
+        "user": parsed.username,
+        "password": parsed.password,
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 3306,
+        "database": (parsed.path or "/").lstrip("/")
+    }
+
+
+def _get_connection():
+    if not MYSQL_URL:
+        raise RuntimeError("MYSQL_URL is not set")
+    config = _parse_mysql_url(MYSQL_URL)
+    return mysql.connector.connect(**config)
+
+
+def _init_db():
+    try:
+        conn = _get_connection()
+    except Exception:
+        return
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telemetry (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                timestamp VARCHAR(32) NOT NULL,
+                safe FLOAT NOT NULL,
+                rocks FLOAT NOT NULL,
+                crater FLOAT NOT NULL,
+                source VARCHAR(64) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS path_runs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                timestamp VARCHAR(32) NOT NULL,
+                image_name VARCHAR(255),
+                algorithm VARCHAR(64) NOT NULL,
+                safety_mode BOOLEAN NOT NULL,
+                start_row INT NOT NULL,
+                start_col INT NOT NULL,
+                goal_row INT NOT NULL,
+                goal_col INT NOT NULL,
+                planning_time_ms FLOAT,
+                nodes_explored INT,
+                path_length INT,
+                total_cost FLOAT,
+                safe_percentage FLOAT,
+                risk_score FLOAT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class Payload(BaseModel):
@@ -19,21 +88,132 @@ class Payload(BaseModel):
     source: str
 
 
+class PathRun(BaseModel):
+    timestamp: str
+    image_name: str | None = None
+    algorithm: str
+    safety_mode: bool
+    start_row: int
+    start_col: int
+    goal_row: int
+    goal_col: int
+    planning_time_ms: float | None = None
+    nodes_explored: int | None = None
+    path_length: int | None = None
+    total_cost: float | None = None
+    safe_percentage: float | None = None
+    risk_score: float | None = None
+
+
 @app.post("/update")
 def update(data: Payload):
-    record = data.dict()
-    telemetry_history.append(record)
+    try:
+        conn = _get_connection()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO telemetry (timestamp, safe, rocks, crater, source)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (data.timestamp, data.safe, data.rocks, data.crater, data.source)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"status": "received"}
+
+
+@app.post("/path_run")
+def path_run(data: PathRun):
+    try:
+        conn = _get_connection()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO path_runs (
+                timestamp, image_name, algorithm, safety_mode,
+                start_row, start_col, goal_row, goal_col,
+                planning_time_ms, nodes_explored, path_length,
+                total_cost, safe_percentage, risk_score
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                data.timestamp,
+                data.image_name,
+                data.algorithm,
+                data.safety_mode,
+                data.start_row,
+                data.start_col,
+                data.goal_row,
+                data.goal_col,
+                data.planning_time_ms,
+                data.nodes_explored,
+                data.path_length,
+                data.total_cost,
+                data.safe_percentage,
+                data.risk_score
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
     return {"status": "received"}
 
 
 @app.get("/latest")
 def latest():
-    return telemetry_history[-1] if telemetry_history else {}
+    try:
+        conn = _get_connection()
+    except Exception:
+        return {}
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM telemetry ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        return row or {}
+    finally:
+        conn.close()
 
 
 @app.get("/history")
 def history():
-    return telemetry_history
+    try:
+        conn = _get_connection()
+    except Exception:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM telemetry ORDER BY id DESC LIMIT 200")
+        rows = cursor.fetchall()
+        return list(reversed(rows))
+    finally:
+        conn.close()
+
+
+@app.get("/path_runs")
+def path_runs():
+    try:
+        conn = _get_connection()
+    except Exception:
+        return []
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM path_runs ORDER BY id DESC LIMIT 200")
+        rows = cursor.fetchall()
+        return list(reversed(rows))
+    finally:
+        conn.close()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -137,3 +317,8 @@ def dashboard():
     </html>
     """
     return HTMLResponse(content=html)
+
+
+@app.on_event("startup")
+def _startup():
+    _init_db()

@@ -22,12 +22,17 @@ torch.serialization.add_safe_globals([
 ])
 
 # ======================================================
-# CLOUD ENDPOINT (RENDER)
+# CLOUD ENDPOINT
 # ======================================================
-CLOUD_API_URL = "https://hazard-detection-of-chandrayaan-3-imagery-gwr1.onrender.com/update"
+CLOUD_API_URL = os.getenv(
+    "CLOUD_API_URL",
+    "https://hazard-detection-of-chandrayaan-3-imagery.onrender.com"
+)
+
 
 # Local buffer file for offline-first telemetry.
 BUFFER_FILE = "telemetry_buffer.json"
+PATH_RUN_BUFFER_FILE = "path_run_buffer.json"
 
 # ======================================================
 # IMAGE TRANSFORM
@@ -67,26 +72,26 @@ def edge_inference(model, img, device):
 # ======================================================
 # TELEMETRY BUFFER HELPERS
 # ======================================================
-def _load_buffer() -> List[dict]:
-    if not os.path.exists(BUFFER_FILE):
+def _load_buffer(file_path: str) -> List[dict]:
+    if not os.path.exists(file_path):
         return []
     try:
-        with open(BUFFER_FILE, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         # Corrupt buffer: start fresh but do not block inference
         return []
 
 
-def _persist_buffer(buffer: List[dict]) -> None:
-    with open(BUFFER_FILE, "w", encoding="utf-8") as f:
+def _persist_buffer(file_path: str, buffer: List[dict]) -> None:
+    with open(file_path, "w", encoding="utf-8") as f:
         json.dump(buffer, f)
 
 
-def _post_payload(payload: dict) -> bool:
+def _post_payload(url: str, payload: dict) -> bool:
     try:
         r = requests.post(
-            CLOUD_API_URL,
+            url,
             json=payload,
             timeout=3
         )
@@ -95,19 +100,19 @@ def _post_payload(payload: dict) -> bool:
         return False
 
 
-def _flush_buffer(buffer: List[dict]) -> bool:
+def _flush_buffer(url: str, file_path: str, buffer: List[dict]) -> bool:
     """Send buffered telemetry in-order; stop at first failure."""
     if not buffer:
         return True
 
     for idx, item in enumerate(buffer):
-        if not _post_payload(item):
+        if not _post_payload(url, item):
             # Preserve remaining items in order for a later retry
-            _persist_buffer(buffer[idx:])
+            _persist_buffer(file_path, buffer[idx:])
             return False
 
     # All sent; clear buffer
-    _persist_buffer([])
+    _persist_buffer(file_path, [])
     return True
 
 
@@ -121,23 +126,24 @@ def push_result_to_cloud(payload: dict) -> bool:
     - If current send fails, append it to the buffer.
     - Always returns quickly to avoid blocking edge inference.
     """
-    buffer = _load_buffer()
+    url = f"{CLOUD_API_URL}/update"
+    buffer = _load_buffer(BUFFER_FILE)
 
     # Try to flush older records before the newest one.
-    if not _flush_buffer(buffer):
-        buffer = _load_buffer()
+    if not _flush_buffer(url, BUFFER_FILE, buffer):
+        buffer = _load_buffer(BUFFER_FILE)
         buffer.append(payload)
-        _persist_buffer(buffer)
+        _persist_buffer(BUFFER_FILE, buffer)
         return False
 
     # Send the latest payload after older ones are flushed.
-    if _post_payload(payload):
+    if _post_payload(url, payload):
         return True
 
     # Network still down: buffer the new payload.
-    buffer = _load_buffer()
+    buffer = _load_buffer(BUFFER_FILE)
     buffer.append(payload)
-    _persist_buffer(buffer)
+    _persist_buffer(BUFFER_FILE, buffer)
     return False
 
 
@@ -149,15 +155,38 @@ def auto_sync_buffer() -> int:
     
     Returns the number of records successfully synced.
     """
-    buffer = _load_buffer()
+    url = f"{CLOUD_API_URL}/update"
+    buffer = _load_buffer(BUFFER_FILE)
     if not buffer:
         return 0
     
     initial_count = len(buffer)
-    _flush_buffer(buffer)
+    _flush_buffer(url, BUFFER_FILE, buffer)
     
     # Check how many are left after flush
-    remaining_buffer = _load_buffer()
+    remaining_buffer = _load_buffer(BUFFER_FILE)
     synced_count = initial_count - len(remaining_buffer)
     
     return synced_count
+
+
+def push_path_run_to_cloud(payload: dict) -> bool:
+    """Send path run telemetry; buffer locally if offline."""
+    url = f"{CLOUD_API_URL}/path_run"
+    buffer = _load_buffer(PATH_RUN_BUFFER_FILE)
+
+    if not _flush_buffer(url, PATH_RUN_BUFFER_FILE, buffer):
+        buffer = _load_buffer(PATH_RUN_BUFFER_FILE)
+        buffer.append(payload)
+        _persist_buffer(PATH_RUN_BUFFER_FILE, buffer)
+        return False
+
+    if _post_payload(url, payload):
+        return True
+
+    buffer = _load_buffer(PATH_RUN_BUFFER_FILE)
+    buffer.append(payload)
+    _persist_buffer(PATH_RUN_BUFFER_FILE, buffer)
+    return False
+
+
